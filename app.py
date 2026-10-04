@@ -1,8 +1,10 @@
 import io
 import os
+import queue
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from urllib.parse import urlparse
 from PIL import Image
@@ -11,11 +13,10 @@ import yt_dlp
 from playwright.sync_api import sync_playwright
 
 # -----------------------------------------------------------------------------
-# 1. CLOUD BOOTSTRAP: Ensure Playwright Chromium binary is installed
+# 1. CLOUD BOOTSTRAP: Playwright Chromium
 # -----------------------------------------------------------------------------
 @st.cache_resource
 def install_playwright_browsers():
-    """Installs Chromium binaries inside Streamlit container once on boot."""
     try:
         subprocess.run(["playwright", "install", "chromium"], check=True)
     except Exception as e:
@@ -23,8 +24,11 @@ def install_playwright_browsers():
 
 install_playwright_browsers()
 
+VIEWPORT_W = 1280
+VIEWPORT_H = 720
+
 # -----------------------------------------------------------------------------
-# 2. STREAM DETECTION & CLASSIFICATION
+# 2. STREAM DETECTION HELPER
 # -----------------------------------------------------------------------------
 def get_media_kind(url: str, ctype: str = "") -> str:
     path = urlparse(url).path.lower()
@@ -38,59 +42,110 @@ def get_media_kind(url: str, ctype: str = "") -> str:
     return None
 
 # -----------------------------------------------------------------------------
-# 3. BROWSER SESSION MANAGER
+# 3. DEDICATED THREAD-SAFE BROWSER WORKER
 # -----------------------------------------------------------------------------
-VIEWPORT_W = 1280
-VIEWPORT_H = 720
+class PlaywrightWorker:
+    """Runs Playwright entirely inside a single background thread to prevent Greenlet thread conflicts."""
+    def __init__(self):
+        self.cmd_queue = queue.Queue()
+        self.captured_streams = []
+        self.seen_urls = set()
+        self.thread = threading.Thread(target=self._run_loop, daemon=True)
+        self.thread.start()
 
-def init_browser():
-    """Starts or resumes a persistent browser session in Streamlit session_state."""
-    if "pw_instance" not in st.session_state:
-        st.session_state.pw_instance = sync_playwright().start()
-        st.session_state.browser = st.session_state.pw_instance.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--autoplay-policy=no-user-gesture-required"
-            ]
-        )
-        st.session_state.context = st.session_state.browser.new_context(
-            viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        )
-        st.session_state.page = st.session_state.context.new_page()
+    def _run_loop(self):
+        with sync_playwright() as p:
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-setuid-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--autoplay-policy=no-user-gesture-required"
+                ]
+            )
+            context = browser.new_context(
+                viewport={"width": VIEWPORT_W, "height": VIEWPORT_H},
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            )
+            page = context.new_page()
 
-        # Sniff network requests on background responses
-        def on_response(resp):
-            try:
-                url = resp.url
-                ctype = resp.headers.get("content-type", "")
-                kind = get_media_kind(url, ctype)
-                if kind:
-                    existing_urls = [item["url"] for item in st.session_state.captured_streams]
-                    if url not in existing_urls:
+            def on_response(resp):
+                try:
+                    url = resp.url
+                    ctype = resp.headers.get("content-type", "")
+                    kind = get_media_kind(url, ctype)
+                    if kind and url not in self.seen_urls:
+                        self.seen_urls.add(url)
                         req = resp.request
-                        st.session_state.captured_streams.append({
+                        self.captured_streams.append({
                             "url": url,
                             "kind": kind,
                             "ua": req.headers.get("user-agent", ""),
                             "referer": req.headers.get("referer", resp.frame.url if resp.frame else ""),
-                            "cookies": st.session_state.context.cookies(url),
+                            "cookies": context.cookies(url),
                         })
-            except Exception:
-                pass
+                except Exception:
+                    pass
 
-        st.session_state.page.on("response", on_response)
+            page.on("response", on_response)
 
-if "captured_streams" not in st.session_state:
-    st.session_state.captured_streams = []
+            while True:
+                action, args, resp_queue = self.cmd_queue.get()
+                try:
+                    if action == "goto":
+                        url = args["url"]
+                        page.goto(url, wait_until="domcontentloaded", timeout=40000)
+                        time.sleep(2)
+                        resp_queue.put({"status": "ok"})
 
-init_browser()
+                    elif action == "screenshot":
+                        screenshot_bytes = page.screenshot()
+                        resp_queue.put({"status": "ok", "data": screenshot_bytes})
+
+                    elif action == "click":
+                        x, y = args["x"], args["y"]
+                        page.mouse.click(x, y)
+                        time.sleep(1.2)
+                        resp_queue.put({"status": "ok"})
+
+                    elif action == "scroll":
+                        page.evaluate("() => window.scrollBy(0, 500)")
+                        time.sleep(1)
+                        resp_queue.put({"status": "ok"})
+
+                    elif action == "play":
+                        page.evaluate("""() => {
+                            document.querySelectorAll('video').forEach(v => { v.muted = false; v.play().catch(() => {}); });
+                        }""")
+                        time.sleep(1)
+                        resp_queue.put({"status": "ok"})
+
+                    elif action == "pause":
+                        page.evaluate("() => { document.querySelectorAll('video').forEach(v => v.pause()); }")
+                        resp_queue.put({"status": "ok"})
+
+                    elif action == "clear_streams":
+                        self.captured_streams.clear()
+                        self.seen_urls.clear()
+                        resp_queue.put({"status": "ok"})
+
+                except Exception as e:
+                    resp_queue.put({"status": "error", "message": str(e)})
+
+    def execute(self, action, **args):
+        resp_queue = queue.Queue()
+        self.cmd_queue.put((action, args, resp_queue))
+        return resp_queue.get(timeout=45)
+
+@st.cache_resource
+def get_browser_worker():
+    return PlaywrightWorker()
+
+worker = get_browser_worker()
 
 # -----------------------------------------------------------------------------
-# 4. DOWNLOAD ENGINE WITH RESOLUTION SELECTION
+# 4. YT-DLP DOWNLOAD ENGINE
 # -----------------------------------------------------------------------------
 def download_stream(item: dict, quality_preset: str, progress_bar, status_text):
     temp_dir = tempfile.mkdtemp()
@@ -99,7 +154,6 @@ def download_stream(item: dict, quality_preset: str, progress_bar, status_text):
 
     cookie_header = "; ".join(f"{c['name']}={c['value']}" for c in item.get("cookies", []))
 
-    # Format resolution string for yt-dlp
     if quality_preset == "Highest (1080p/4K)":
         format_selector = "bestvideo+bestaudio/best"
     elif quality_preset == "720p":
@@ -155,7 +209,7 @@ def download_stream(item: dict, quality_preset: str, progress_bar, status_text):
     return None
 
 # -----------------------------------------------------------------------------
-# 5. STREAMLIT UI: REMOTE CONTROL & MOBILE DOWNLOADS
+# 5. STREAMLIT UI
 # -----------------------------------------------------------------------------
 st.set_page_config(page_title="Remote Media Sniffer", page_icon="🎬", layout="centered")
 
@@ -163,14 +217,12 @@ st.markdown("""
 <style>
     .block-container { padding-top: 1.2rem; padding-bottom: 3.5rem; max-width: 720px; }
     .stButton>button { width: 100%; border-radius: 8px; font-weight: 600; }
-    .control-box { background: #1e293b; padding: 12px; border-radius: 10px; margin-bottom: 12px; }
 </style>
 """, unsafe_allow_html=True)
 
 st.title("🎬 Remote Web Navigator & Sniffer")
 st.caption("Visually interact with web video players to trigger 1080p quality, capture streams, and download on mobile.")
 
-# URL Navigation Bar
 nav_col1, nav_col2 = st.columns([3, 1])
 with nav_col1:
     target_url = st.text_input("Target Web URL:", placeholder="https://example.com/video")
@@ -178,47 +230,39 @@ with nav_col2:
     st.write(" ")
     if st.button("🌐 Navigate", use_container_width=True):
         if target_url:
-            with st.spinner("Loading webpage..."):
-                try:
-                    st.session_state.page.goto(target_url, wait_until="domcontentloaded", timeout=40000)
-                    time.sleep(2)
-                except Exception as e:
-                    st.error(f"Navigation error: {e}")
+            with st.spinner("Navigating in background thread..."):
+                res = worker.execute("goto", url=target_url)
+                if res["status"] == "error":
+                    st.error(f"Navigation error: {res['message']}")
+                else:
+                    st.rerun()
 
-# Remote Viewport Screen
-page = st.session_state.page
-try:
-    screenshot_bytes = page.screenshot()
-    img = Image.open(io.BytesIO(screenshot_bytes))
+# Take screenshot safely through the worker thread
+res_img = worker.execute("screenshot")
+if res_img["status"] == "ok":
+    img = Image.open(io.BytesIO(res_img["data"]))
     st.image(img, caption="Live Browser Viewport (1280 × 720)", use_container_width=True)
-except Exception:
+else:
     st.info("No active page loaded yet. Enter a URL above and click Navigate.")
 
-# --- REMOTE CONTROL PANEL ---
 st.markdown("### 🖱️ Touch & Player Controls")
 
-# Row 1: Quick Actions
 act1, act2, act3 = st.columns(3)
 with act1:
     if st.button("▶️ Force Play All"):
-        page.evaluate("""() => {
-            document.querySelectorAll('video').forEach(v => { v.muted = false; v.play().catch(() => {}); });
-        }""")
-        time.sleep(1)
+        worker.execute("play")
         st.rerun()
 with act2:
     if st.button("⏸️ Pause All"):
-        page.evaluate("() => { document.querySelectorAll('video').forEach(v => v.pause()); }")
+        worker.execute("pause")
         st.rerun()
 with act3:
     if st.button("📜 Scroll Down"):
-        page.evaluate("() => window.scrollBy(0, 500)")
-        time.sleep(1)
+        worker.execute("scroll")
         st.rerun()
 
-# Row 2: Precision Click Coordinates
 with st.expander("🎯 Precision Coordinate Tap", expanded=True):
-    st.caption("Inspect the image above to target the gear icon, play button, or resolution dropdown.")
+    st.caption("Inspect the viewport image above to tap player controls, popups, or resolution options.")
     coord_col1, coord_col2, coord_col3 = st.columns([1, 1, 1])
     with coord_col1:
         click_x = st.number_input("X Coordinate", min_value=0, max_value=VIEWPORT_W, value=640, step=10)
@@ -227,17 +271,13 @@ with st.expander("🎯 Precision Coordinate Tap", expanded=True):
     with coord_col3:
         st.write(" ")
         if st.button("👆 Tap Coordinates", use_container_width=True):
-            page.mouse.click(click_x, click_y)
-            time.sleep(1.5)  # Allow time for quality menu / popup to open
+            worker.execute("click", x=click_x, y=click_y)
             st.rerun()
 
-# Row 3: Preset Hotspots for Common Web Players
 preset_col1, preset_col2 = st.columns(2)
 with preset_col1:
     if st.button("⚙️ Bottom-Right (Player Bar)"):
-        # Most player settings/gear icons sit around X: 1210-1250, Y: 680-700
-        page.mouse.click(1220, 685)
-        time.sleep(1.2)
+        worker.execute("click", x=1220, y=685)
         st.rerun()
 with preset_col2:
     if st.button("🔄 Refresh View"):
@@ -246,16 +286,16 @@ with preset_col2:
 st.markdown("---")
 
 # -----------------------------------------------------------------------------
-# 6. DETECTED STREAM QUEUE & MOBILE DOWNLOAD
+# 6. CAPTURED MEDIA STREAMS & DOWNLOADS
 # -----------------------------------------------------------------------------
-streams = st.session_state.captured_streams
+streams = worker.captured_streams
 st.markdown(f"### 📡 Captured Media Streams ({len(streams)})")
 
 if not streams:
-    st.info("No streams captured yet. Tap **Force Play All** or click the player to trigger stream initialization.")
+    st.info("No streams captured yet. Tap **▶️ Force Play All** or click player controls to trigger playback.")
 else:
     if st.button("🗑️ Clear Stream History"):
-        st.session_state.captured_streams = []
+        worker.execute("clear_streams")
         st.rerun()
 
     for idx, item in enumerate(streams):
